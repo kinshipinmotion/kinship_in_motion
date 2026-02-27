@@ -1,0 +1,306 @@
+import Sigma from 'sigma';
+import graphology from 'graphology';
+import Papa from 'papaparse';
+import EdgeCurveProgram from "@sigma/edge-curve";
+import ForceSupervisor from "graphology-layout-force/worker";
+
+import "./style.css";
+
+
+window.onload = function () {
+
+    console.log("Hello");
+
+    // Retrieve some useful DOM elements:
+    const container = document.getElementById("sigma-container");
+    
+    // Initialize the graph instance
+    const graph = new graphology.Graph();
+
+    // Type and declare internal state:
+    /**
+     * @typedef {Object} State
+     * @property {string=} hoveredNode
+     * @property {string=} selectedNode
+     * @property {Set<string>=} suggestions
+     * @property {Set<string>=} hoveredNeighbors
+     */
+    /** @type {State} */
+    const state = {};
+
+    let rowSize = {};
+
+    var results = Papa.parse("./kim_version_1.csv", {
+        download: true,
+        header: true,
+        skipEmptyLines: true,
+        complete: function (results) {
+            console.log("CSV Data Parsed:", results.data);
+            // Process the parsed data here
+
+            // Preprocess nodes and edges from the CSV data:
+            // Make the nodes bigger based on the number of edges
+            const sourceTargetCount = {};
+            results.data.forEach(row => {
+                if (row.Source) {
+                    if (!sourceTargetCount[row.Source]) {
+                        sourceTargetCount[row.Source] = 10;
+                    }
+                    sourceTargetCount[row.Source]++;
+                }
+            });
+
+            results.data.forEach(row => {
+                if (!graph.hasNode(row.Source)) {
+
+                    graph.addNode(row.Source, {
+                        label: row.Source,
+                        x: Math.random(),
+                        y: Math.random(),
+                        size: sourceTargetCount[row.Source],
+                        color: "#" + Math.floor(Math.random() * 16777215).toString(16).padStart(6, "0"),
+                        OtherNames: row['OTHER NAMES'] === "0" ? "N/A" : row['OTHER NAMES'],
+                        EthnicityNationality: row['ETHNICITY/NATIONALITY'] || "N/A",
+                        PhysicalDescriptors: row['PHYSICAL DESCRIPTORS'] === "0" ? "N/A" : row['PHYSICAL DESCRIPTORS'],
+                        Locations: row['LOCATION(S)'] === "0" ? "N/A" : row['LOCATION(S)'],
+                        BiographicalInformation: row['BIOGRAPHICAL INFORMATION'] === "0" ? "N/A" : row['BIOGRAPHICAL INFORMATION']
+                    });
+                }
+            });
+
+            results.data.forEach(row => {
+                if (row.Source && row.Target && graph.hasNode (row.Source) && graph.hasNode(row.Target) && !graph.hasEdge(row.Source, row.Target)) {
+                    graph.addEdge(row.Source, row.Target, { 
+                        size: 2, 
+                        label: row.Label,
+                        curved: true,
+                        forceLabel: true
+                    });
+                }
+            });
+
+            // Create the spring layout and start it
+            const layout = new ForceSupervisor(graph, { 
+                isNodeFixed: (_, attr) => attr.highlighted || attr.clicked,
+                settings: {
+                    attraction: 0.000001,
+                    repulsion: 1,
+                    gravity: 0.000001,
+                    inertia: 0.5
+                }
+            });
+            layout.start();
+
+            // Instantiate sigma:
+            const renderer = new Sigma(graph, container, {
+                allowInvalidContainer: true,
+                renderEdgeLabels: true,
+                defaultEdgeType: "curve",
+                edgeProgramClasses: {
+                    curve: EdgeCurveProgram
+                },
+            });
+
+            // Close button behaviour for the info panel
+            const infoCloseBtn = document.getElementById("info-close");
+            if (infoCloseBtn) {
+                infoCloseBtn.addEventListener("click", () => {
+                    const panel = document.getElementById("info-panel");
+                    if (panel) panel.style.display = "none";
+                });
+            }
+
+            // State for drag'n'drop 
+            let draggedNode = null;
+            let isDragging = false;
+
+            // Bind graph interactions:
+            renderer.on("enterNode", ({ node }) => {
+                if (isDragging) return; // Ignore if dragging
+                graph.setNodeAttribute(node, "highlighted", true);
+                setHoveredNode(node);
+                if (!renderer.getCustomBBox()) renderer.setCustomBBox(renderer.getBBox());
+            });
+            renderer.on("leaveNode", (e) => {
+                if (isDragging) return; // Ignore if dragging
+                // if the node is clicked we keep it highlighted
+                if (graph.getNodeAttribute(e.node, "clicked")) return;
+
+                graph.removeNodeAttribute(e.node, "highlighted");
+                setHoveredNode(undefined);
+            });
+
+            // Render nodes accordingly to the internal state:
+            // 1. If a node is selected, it is highlighted
+            // 2. If there is query, all non-matching nodes are greyed
+            // 3. If there is a hovered node, all non-neighbor nodes are greyed
+            renderer.setSetting("nodeReducer", (node, data) => {
+                const res = { ...data };
+                
+                if (!graph.hasNode(node)) {
+                    return { hidden: true };
+                }
+                if (state.hoveredNeighbors && !state.hoveredNeighbors.has(node) && state.hoveredNode !== node) {
+                    res.label = "";
+                    res.color = "#f6f6f6";
+                }
+
+                if (state.selectedNode === node) {
+                    res.highlighted = true;
+                } else if (state.suggestions) {
+                    if (state.suggestions.has(node)) {
+                        res.forceLabel = true;
+                    } else {
+                        res.label = "";
+                        res.color = "#f6f6f6";
+                    }
+                }
+
+                return res;
+            });
+
+            // Render edges accordingly to the internal state:
+            // 1. If a node is hovered, the edge is hidden if it is not connected to the
+            //    node
+            // 2. If there is a query, the edge is only visible if it connects two
+            //    suggestions
+            renderer.setSetting("edgeReducer", (edge, data) => {
+                const res = { ...data };
+
+                if (
+                    state.hoveredNode &&
+                    !graph.extremities(edge).every((n) => n === state.hoveredNode || graph.areNeighbors(n, state.hoveredNode))
+                ) {
+                    res.hidden = true;
+                }
+
+                if (
+                    state.suggestions &&
+                    (!state.suggestions.has(graph.source(edge)) || !state.suggestions.has(graph.target(edge)))
+                ) {
+                    res.hidden = true;
+                }
+
+                return res;
+            });
+
+            renderer.on("clickNode", ({ node }) => {
+                // Remove clicked and highlight from previously clicked nodes
+                graph.forEachNode((n) => {
+                    graph.removeNodeAttribute(n, "clicked");
+                    graph.removeNodeAttribute(n, "highlighted");
+                });
+
+                // Add clicked attribute to the clicked node
+                graph.setNodeAttribute(node, "clicked", true);
+                // Add highlight attribute to the clicked node
+                graph.setNodeAttribute(node, "highlighted", true);
+
+                // Get node attributes
+                const data = graph.getNodeAttributes(node);
+
+                // Build summary HTML (customize as needed)
+                const html = `
+                    <h3><u>Name</u></h3>
+                    <div>${node}</div>
+                    <h3><u>Other Names</u></h3>
+                    <div>${data.OtherNames || "N/A"}</div>
+                    <h3><u>Ethnicity / Nationality</u></h3>
+                    <div>${data.EthnicityNationality || "N/A"}</div>
+                    <h3><u>Physical Descriptors</u></h3>
+                    <div>${data.PhysicalDescriptors || "N/A"}</div>
+                    <h3><u>Locations</u></h3>
+                    <div>${data.Locations || "N/A"}</div>
+                    <h3><u>Biographical Information</u></h3>
+                    <div style="max-height:400px;overflow: auto">${data.BiographicalInformation || "N/A"}</div>
+                `;
+
+                // Show and update the panel
+                const panel = document.getElementById("info-panel");
+                const content = document.getElementById("info-content");
+                if (content) content.innerHTML = html;
+                if (panel) panel.style.display = "block";
+            });
+
+            // Optional: Hide the panel when clicking elsewhere
+            renderer.on("clickStage", () => {
+                document.getElementById("info-panel").style.display = "none";
+                // Remove clicked from all nodes
+                graph.forEachNode((n) => {
+                    graph.removeNodeAttribute(n, "highlighted");
+                    graph.removeNodeAttribute(n, "clicked");
+                    draggedNode = null;
+                    setHoveredNode(undefined);
+                });
+            });
+
+              //
+            // Drag'n'drop feature
+            // ~~~~~~~~~~~~~~~~~~~
+            //
+
+            // On mouse down on a node
+            //  - we enable the drag mode
+            //  - save in the dragged node in the state
+            //  - highlight the node
+            //  - disable the camera so its state is not updated
+            renderer.on("downNode", (e) => {
+                isDragging = true;
+                draggedNode = e.node;
+                graph.setNodeAttribute(draggedNode, "highlighted", true);
+                if (!renderer.getCustomBBox()) renderer.setCustomBBox(renderer.getBBox());
+            });
+
+            // On mouse move, if the drag mode is enabled, we change the position of the draggedNode
+            renderer.on("moveBody", ({ event }) => {
+                if (!isDragging || !draggedNode) return;
+
+                // Get new position of node
+                const pos = renderer.viewportToGraph(event);
+
+                graph.setNodeAttribute(draggedNode, "x", pos.x);
+                graph.setNodeAttribute(draggedNode, "y", pos.y);
+
+                // Prevent sigma to move camera:
+                event.preventSigmaDefault();
+                event.original.preventDefault();
+                event.original.stopPropagation();
+            });
+
+            // On mouse up, we reset the dragging mode
+            const handleUp = () => {
+                if (draggedNode) {
+                    graph.removeNodeAttribute(draggedNode, "highlighted");
+                }
+                isDragging = false;
+                draggedNode = null;
+                            };
+            renderer.on("upNode", handleUp);
+            renderer.on("upStage", handleUp);
+
+            function setHoveredNode(node) {
+                if (node) {
+                    state.hoveredNode = node;
+                    state.hoveredNeighbors = new Set(graph.neighbors(node));
+                }
+
+                if (!node) {
+                    state.hoveredNode = undefined;
+                    state.hoveredNeighbors = undefined;
+                }
+
+                // Refresh rendering
+                renderer.refresh({
+                    // We don't touch the graph data so we can skip its reindexation
+                    skipIndexation: true,
+                });
+            }
+        },
+        error: function (error) {
+            console.error("Error parsing CSV:", error);
+        }
+    });
+
+
+};
+
